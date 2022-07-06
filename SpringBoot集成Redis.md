@@ -1,55 +1,170 @@
-# Redis
+# SpringBoot集成Redis
 
-## redis缓存雪崩
+添加依赖，使用lettuce作为客户端
 
-### 原因
+```xml
+		<!-- spring boot redis 缓存引入 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <!-- redis lettuce pool 需要这个依赖 -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-pool2</artifactId>
+        </dependency>
+```
 
- `redis中同一时间大量缓存过期，造成请求直接到数据库增加数据库压力；redis宕机，请求直接入数据库查询增大数据库压力`
+添加key序列化（可配置前缀）
 
-### 解决方案
+```java
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.parser.ParserConfig;
+import com.alibaba.fastjson.serializer.SerializerFeature;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.serializer.RedisSerializer;
+import org.springframework.data.redis.serializer.SerializationException;
 
-#### 针对redis不可用
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 
-1. 采用redis集群，保证一节点挂掉不会影响cache
+/**
+ * 为redis key 统一加上前缀
+ */
+@Slf4j
+public class RedisKeySerializer implements RedisSerializer<String> {
+	public static final Charset DEFAULT_CHARSET = StandardCharsets.UTF_8;
 
-2. 限流，避免同时处理大量的请求
+	static {
+		ParserConfig.getGlobalInstance().setAutoTypeSupport(true);
+	}
 
-#### 针对redis中缓存同时过期
+	private String prefix;
 
-1. 设置不同的过期时间
-2. 缓存永不过期(不推荐，内存爆炸)
+	public RedisKeySerializer(String prefix) {
+		super();
+		this.prefix = prefix;
+	}
 
-## redis缓存穿透
+	/**
+	 * 序列化
+	 */
+	@Override
+	public byte[] serialize(String key) throws SerializationException {
+		if (null == key) {
+			return new byte[0];
+		}
+		return JSON.toJSONString(prefix + key, SerializerFeature.WriteClassName).getBytes(DEFAULT_CHARSET);
+	}
 
-### 原因
+	/**
+	 * 反序列化
+	 */
+	@Override
+	public String deserialize(byte[] bytes) throws SerializationException {
+		if (null == bytes || bytes.length <= 0) {
+			return null;
+		}
+		String text = new String(bytes, DEFAULT_CHARSET);
+		return JSON.parseObject(prefix + text, String.class);
+	}
+}
+```
 
-` 大量请求携带无效redis-key进入，redis中查询不到，转到数据库查询，增加数据库压力`
+添加value序列化
 
-### 解决方案
+```java
+public class FastJson2JsonRedisSerializer<T> implements RedisSerializer<T> {
 
-优先做好入参的key的格式校验，非合法格式不允许进入。
+    public static final Charset DEFAULT_CHARSET = StandardCharsets.UTF_8;
 
-其余解决方案：
+    static {
+        ParserConfig.getGlobalInstance().setAutoTypeSupport(true);
+    }
 
-1. 布隆过滤器  
-2. 数据库中未查询到时在redis中缓存空值(不推荐，无法防御不同的key构造)
+    private final Class<T> clazz;
 
-## 布隆过滤器
+    public FastJson2JsonRedisSerializer(Class<T> clazz) {
+        super();
+        this.clazz = clazz;
+    }
 
-### 原理
+    /**
+     * 序列化
+     */
+    @Override
+    public byte[] serialize(T t) throws SerializationException {
+        if (null == t) {
+            return new byte[0];
+        }
+       return JSON.toJSONString(t, SerializerFeature.WriteClassName).getBytes(DEFAULT_CHARSET);
+    }
 
-key进入布隆过滤器中采用多种hash函数进行hash处理，采用bit数组存放同一key不同的hash值，将hash值对应的数组下标位置置为1。当key再次进入布隆过滤器，hash运算后查找 ，如果都是1那么代表已经存在，直接过滤请求，如果某个为0，则代表未进入可放行
+    /**
+     * 反序列化
+     */
+    @Override
+    public T deserialize(byte[] bytes) throws SerializationException {
+        if (null == bytes || bytes.length <= 0) {
+            return null;
+        }
+        return (T) JSON.parseObject(new String(bytes, DEFAULT_CHARSET), clazz);
+    }
+}
+```
 
-比如 `"key".hash1 = 2;"key".hash2 = 3;"key".hash3 = 6` 则会放入数组中 2、3、6的位置
+配置redis序列化，采用自定义的序列化配置
 
-如果数组初始化长度为10，则当前为`[0,0,1,1,0,0,1,0,0,0]` 
+```java
+/**
+ * @description Redis配置类：Lettuce客户端
+ */
+@Configuration
+@Slf4j
+public class LettuceRedisConfig {
 
-### 优缺点
+   @Value("${redis.key-prefix}")
+   private String prefix;
 
-优点：能够过滤大部分无效key
+   @Bean(name = "l2RedisTemplate")
+   public RedisTemplate<String, Object> l2RedisTemplate(LettuceConnectionFactory lettuceConnectionFactory) {
+      // 配置redisTemplate
+      RedisTemplate<String, Object> redisTemplate = new RedisTemplate<>();
+      redisTemplate.setConnectionFactory(lettuceConnectionFactory);
+      // 设置序列化
+      RedisKeySerializer redisKeySerializer = new RedisKeySerializer(prefix);
+      FastJson2JsonRedisSerializer<Object> valueSerializer = new FastJson2JsonRedisSerializer<>(Object.class);
+      // key序列化，使用自定义序列化方式
+      redisTemplate.setKeySerializer(redisKeySerializer);
+      // value序列化
+      redisTemplate.setValueSerializer(valueSerializer);
+      // Hash key序列化，使用自定义序列化方式
+      redisTemplate.setHashKeySerializer(redisKeySerializer);
+      // Hash value序列化
+      redisTemplate.setHashValueSerializer(valueSerializer);
+      redisTemplate.afterPropertiesSet();
+      return redisTemplate;
+   }
 
-缺点：
-
-1. 无法删除
-
-2. 可能存在相同的hash值，key可能不存在但是hash结果显示已被占用。（hash冲突）
+   @Bean(name = "l2StringRedisTemplate")
+   public RedisTemplate<String, String> l2StringRedisTemplate(LettuceConnectionFactory lettuceConnectionFactory) {
+      // 配置redisTemplate
+      RedisTemplate<String, String> redisTemplate = new RedisTemplate<>();
+      redisTemplate.setConnectionFactory(lettuceConnectionFactory);
+      // 设置序列化
+      RedisKeySerializer redisKeySerializer = new RedisKeySerializer(prefix);
+      log.info("redis-prefix:{}", prefix);
+      FastJson2JsonRedisSerializer<Object> valueSerializer = new FastJson2JsonRedisSerializer<>(Object.class);
+      // key序列化，使用自定义序列化方式
+      redisTemplate.setKeySerializer(redisKeySerializer);
+      // value序列化
+      redisTemplate.setValueSerializer(valueSerializer);
+      // Hash key序列化，使用自定义序列化方式
+      redisTemplate.setHashKeySerializer(redisKeySerializer);
+      // Hash value序列化
+      redisTemplate.setHashValueSerializer(valueSerializer);
+      redisTemplate.afterPropertiesSet();
+      return redisTemplate;
+   }
+}
+```
